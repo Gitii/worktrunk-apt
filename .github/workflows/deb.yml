@@ -1,0 +1,108 @@
+name: Build Debian packages
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags:
+      - 'v[0-9]*'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Published Worktrunk version or tag (for example, v0.80.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deb-${{ inputs.version || github.event.release.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Ubuntu ${{ matrix.ubuntu }} (amd64)
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:${{ matrix.ubuntu }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ['24.04', '26.04']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y build-essential pkg-config dpkg-dev curl ca-certificates git
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          curl --fail --silent --show-error --location https://sh.rustup.rs --output "$RUNNER_TEMP/rustup-init.sh"
+          bash "$RUNNER_TEMP/rustup-init.sh" -y --profile minimal --default-toolchain stable --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build package from the published Cargo crate
+        env:
+          WORKTRUNK_VERSION: ${{ inputs.version || github.event.release.tag_name || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || 'v0.80.0' }}
+          UBUNTU_VERSION: ${{ matrix.ubuntu }}
+        run: bash scripts/build-deb.sh "$WORKTRUNK_VERSION" "$UBUNTU_VERSION" dist
+
+      - name: Test package installation
+        run: |
+          apt-get install -y ./dist/*.deb
+          /usr/bin/wt --version
+          /usr/bin/wt --help
+          test "$(dpkg-query -W -f='${Status}' worktrunk)" = 'install ok installed'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worktrunk-ubuntu-${{ matrix.ubuntu }}-amd64
+          path: |
+            dist/*.deb
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Attach packages to release
+    if: github.event_name == 'release' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: worktrunk-ubuntu-*-amd64
+          merge-multiple: true
+          path: dist
+
+      - name: Create release if needed and upload packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Packaging releases use the exact upstream release tag.
+          gh api "repos/max-sixty/worktrunk/releases/tags/$RELEASE_TAG" --jq .tag_name
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            flags=()
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" --verify-tag \
+              --title "Worktrunk $RELEASE_TAG" \
+              --notes 'Worktrunk Debian packages for Ubuntu 24.04 and 26.04 (amd64), built from the published Cargo crate.' \
+              "${flags[@]}"
+          fi
+          gh release upload "$RELEASE_TAG" dist/*.deb dist/*.sha256 --clobber
